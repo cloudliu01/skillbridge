@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import subprocess
 from argparse import ArgumentParser
 from logging import WARNING, basicConfig, getLogger
-from os import getenv
+from os import chmod, chown, getenv
 from pathlib import Path
 from select import select
 from socketserver import BaseRequestHandler, BaseServer, StreamRequestHandler, ThreadingMixIn
@@ -50,12 +51,10 @@ def create_windows_server_class(single: bool) -> type[BaseServer]:
 
         def server_bind(self) -> None:
             try:
-                from socket import (  # type: ignore[attr-defined]  # noqa: PLC0415
-                    SIO_LOOPBACK_FAST_PATH,
-                )
+                import socket  # noqa: PLC0415
 
                 self.socket.ioctl(  # type: ignore[attr-defined]
-                    SIO_LOOPBACK_FAST_PATH,
+                    socket.SIO_LOOPBACK_FAST_PATH,  # type: ignore[attr-defined]
                     True,  # noqa: FBT003
                 )
             except ImportError:
@@ -80,6 +79,9 @@ def create_unix_server_class(single: bool) -> type[BaseServer]:
         request_queue_size = 0
         allow_reuse_address = True
 
+        allow_gid: int | None = None
+        allow_extra_user: str | None = None
+
         def __init__(self, file: str, handler: type[BaseRequestHandler]) -> None:
             self.path = f'/tmp/skill-server-{file}.sock'
             with contextlib.suppress(FileNotFoundError):
@@ -87,10 +89,43 @@ def create_unix_server_class(single: bool) -> type[BaseServer]:
 
             super().__init__(self.path, handler)
 
+            if self.allow_gid is not None:
+                from grp import getgrgid  # noqa: PLC0415
+
+                chown(self.path, -1, self.allow_gid)
+                chmod(self.path, 0o660)
+                logger.info(
+                    "shared unix socket %s with gid=%s (%s)",
+                    self.path,
+                    self.allow_gid,
+                    getgrgid(self.allow_gid).gr_name,
+                )
+
+            if self.allow_extra_user is not None:
+                if self.allow_gid is None:
+                    chmod(self.path, 0o600)
+                subprocess.run(
+                    ['setfacl', '-m', f'u:{self.allow_extra_user}:rw', self.path],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                logger.info(
+                    "shared unix socket %s with user=%s via ACL",
+                    self.path,
+                    self.allow_extra_user,
+                )
+
     class ThreadingUnixServer(ThreadingMixIn, SingleUnixServer):
         pass
 
     return SingleUnixServer if single else ThreadingUnixServer
+
+
+def resolve_allow_gid(allow_gid: int | None) -> int | None:
+    if platform == 'win32':
+        return None
+    return allow_gid
 
 
 def data_unix_ready(timeout: float | None) -> bool:
@@ -156,16 +191,30 @@ class Handler(StreamRequestHandler):
             client_is_connected = self.try_handle_one_request()
 
 
-def main(id_: str, log_level: str, notify: bool, single: bool, timeout: float | None) -> None:
+def main(
+    id_: str,
+    log_level: str,
+    notify: bool,
+    single: bool,
+    timeout: float | None,
+    allow_gid: int | None,
+    allow_extra_user: str | None,
+) -> None:
     logger.setLevel(getattr(logging, log_level))
 
     server_class = create_server_class(single)
+    resolved_allow_gid = resolve_allow_gid(allow_gid)
+
+    if platform != 'win32':
+        server_class.allow_gid = resolved_allow_gid  # type: ignore[attr-defined]
+        server_class.allow_extra_user = allow_extra_user  # type: ignore[attr-defined]
 
     with server_class(id_, Handler) as server:
         server.skill_timeout = timeout  # type: ignore[attr-defined]
         logger.info(
             f"starting server id={id_} log={log_level} notify={notify} "
-            f"single={single} timeout={timeout}",
+            f"single={single} timeout={timeout} allow_gid={resolved_allow_gid} "
+            f"allow_extra_user={allow_extra_user}",
         )
         if notify:
             send_to_skill('running')
@@ -183,6 +232,8 @@ if __name__ == '__main__':
     argument_parser.add_argument('--notify', action='store_true')
     argument_parser.add_argument('--single', action='store_true')
     argument_parser.add_argument('--timeout', type=float, default=None)
+    argument_parser.add_argument('--allow-gid', type=int, default=None)
+    argument_parser.add_argument('--allow-extra-user', default=None)
 
     ns = argument_parser.parse_args()
 
@@ -190,5 +241,17 @@ if __name__ == '__main__':
         print("Timeout is not possible on Windows", file=stderr)
         sys_exit(1)
 
+    if platform == 'win32' and (ns.allow_gid is not None or ns.allow_extra_user is not None):
+        print("Socket sharing options are not supported on Windows", file=stderr)
+        sys_exit(1)
+
     with contextlib.suppress(KeyboardInterrupt):
-        main(ns.id, ns.log_level, ns.notify, ns.single, ns.timeout)
+        main(
+            ns.id,
+            ns.log_level,
+            ns.notify,
+            ns.single,
+            ns.timeout,
+            ns.allow_gid,
+            ns.allow_extra_user,
+        )
